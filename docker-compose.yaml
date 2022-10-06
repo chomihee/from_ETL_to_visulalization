@@ -1,0 +1,204 @@
+# docker compose spec
+# https://github.com/compose-spec/compose-spec/blob/master/spec.md
+# https://github.com/compose-spec/compose-spec/blob/master/spec.md#extension
+# https://github.com/compose-spec/compose-spec/blob/master/spec.md#fragments
+
+# airflow configs
+# https://airflow.apache.org/docs/apache-airflow/stable/configurations-ref.html#webserver
+
+# ====================================== AIRFLOW ENVIRONMENT VARIABLES =======================================
+---
+version: '3.7'
+x-airflow-common:
+  &airflow-common
+  image: ${AIRFLOW_IMAGE_NAME:-apache/airflow:2.3.3-python3.9}
+  environment:
+    &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__CORE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+    AIRFLOW__CORE__FERNET_KEY: ''
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    AIRFLOW__SCHEDULER__MIN_FILE_PROCESS_INTERVAL: 10
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./logs:/opt/airflow/logs
+    - ./plugins:/opt/airflow/plugins
+    - ./data:/data
+    - ./mlflow:/mlflow
+  user: "${AIRFLOW_UID:-50000}:0"
+  depends_on:
+    postgres:
+      condition: service_healthy
+
+# ====================================== /AIRFLOW ENVIRONMENT VARIABLES ======================================
+
+services:
+  postgres:
+    image: postgres:14
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - postgres-db-volume:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 5s
+      retries: 5
+    restart: always
+    
+  airflow-init:
+    <<: *airflow-common
+    build:
+      context: ./docker/airflow-base
+    image: instork/airflow-init
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        mkdir -p /sources/logs /sources/dags /sources/plugins /sources/data /sources/mlflow 
+        chown -R "${AIRFLOW_UID}:0" /sources/{logs,dags,plugins,data,mlflow}
+        exec /entrypoint airflow version
+    environment:
+      <<: *airflow-common-env
+      _AIRFLOW_DB_UPGRADE: 'true'
+      _AIRFLOW_WWW_USER_CREATE: 'true'
+      _AIRFLOW_WWW_USER_USERNAME: ${_AIRFLOW_WWW_USER_USERNAME-airflow}
+      _AIRFLOW_WWW_USER_PASSWORD: ${_AIRFLOW_WWW_USER_PASSWORD-airflow}
+    user: "0:0"
+    volumes:
+      - .:/sources
+      
+  airflow-webserver:
+    <<: *airflow-common
+    build:
+      context: ./docker/airflow-base
+    image: instork/airflow-webserver
+    command: webserver
+    ports:
+      - 8080:8080
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8085/health"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+    restart: always
+
+  airflow-scheduler:
+    <<: *airflow-common
+    build:
+      context: ./docker/airflow-scheduler
+    image: instork/airflow-scheduler
+    command: scheduler
+    restart: always
+    env_file:
+      - .env
+
+  mongodb:
+    hostname: mongoservice
+    container_name: mongodb
+    image: mongo:4.4.15
+    restart: always
+    ports:
+      - 27017:27017
+    volumes:
+      - ./data/mongodb:/data/db
+    environment:
+      - MONGO_INITDB_ROOT_USERNAME=${MONGO_INITDB_ROOT_USERNAME:-airflow}
+      - MONGO_INITDB_ROOT_PASSWORD=${MONGO_INITDB_ROOT_PASSWORD:-airflow}
+      - MONGO_INITDB_DATABASE=${MONGO_INITDB_DATABASE:-mongotest}
+# ================================= /SUPERSET ENVIRONMENT VARIABLES ======================================
+# https://github.com/apache/superset/blob/master/docker-compose.yml
+
+  superset:
+    image: amancevice/superset
+    container_name: superset
+    restart: always
+    depends_on:
+      - postgres
+    ports:
+      - "8087:8088"
+    networks: 
+      - public
+
+
+# ========================================================
+  s3:
+    image:  minio/minio:RELEASE.2021-11-24T23-19-33Z
+    restart: unless-stopped
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      - MINIO_ROOT_USER=${AWS_ACCESS_KEY_ID}
+      - MINIO_ROOT_PASSWORD=${AWS_SECRET_ACCESS_KEY}
+    command: server /data --console-address ":9001"
+    networks:
+      - internal
+      - public
+    volumes:
+      - minio_volume:/data
+      
+  db:
+    image: mysql/mysql-server:5.7.28
+    restart: unless-stopped
+    container_name: mlflow_db
+    expose:
+      - "3306"
+    environment:
+      - MYSQL_DATABASE=${MYSQL_DATABASE}
+      - MYSQL_USER=${MYSQL_USER}
+      - MYSQL_PASSWORD=${MYSQL_PASSWORD}
+      - MYSQL_ROOT_PASSWORD=${MYSQL_ROOT_PASSWORD}
+    volumes:
+      - db_volume:/data
+    networks:
+      - internal
+
+  mlflow:
+    container_name: tracker_mlflow
+    image: tracker_ml
+    restart: unless-stopped
+    build:
+      context: ./docker/mlflow
+    ports:
+      - "5000:5000"
+    environment:
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      - AWS_DEFAULT_REGION=${AWS_REGION}
+      - MLFLOW_S3_ENDPOINT_URL=http://s3:9000
+    networks:
+      - public
+      - internal
+    entrypoint: bash ./wait-for-it.sh db:3306 -t 90 -- mlflow server --backend-store-uri mysql+pymysql://${MYSQL_USER}:${MYSQL_PASSWORD}@db:3306/${MYSQL_DATABASE} --default-artifact-root s3://${AWS_BUCKET_NAME}/ -h 0.0.0.0
+
+  create_s3_buckets:
+    image: minio/mc
+    depends_on:
+      - "s3"
+    entrypoint: >
+      /bin/sh -c "
+      until (/usr/bin/mc alias set minio http://s3:9000 '${AWS_ACCESS_KEY_ID}' '${AWS_SECRET_ACCESS_KEY}') do echo '...waiting...' && sleep 1; done;
+      /usr/bin/mc mb minio/mlflow;
+      exit 0;
+      "
+    networks:
+      - internal
+
+networks:
+  internal:
+  public:
+    driver: bridge
+
+volumes:
+  postgres-db-volume:
+  db_volume:
+  minio_volume:
+  superset_home:
+    external: false
+  redis:
+    external: false
